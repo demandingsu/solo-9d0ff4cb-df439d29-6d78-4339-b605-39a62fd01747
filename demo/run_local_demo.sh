@@ -36,6 +36,14 @@ for _ in $(seq 1 40); do
 done
 
 echo "== 查询时刻: $QUERY_TIME =="
+echo
+echo "== 1) /query 有效停运链 =="
 curl -s -X POST http://127.0.0.1:8000/query \
+  -H 'Content-Type: application/json' \
+  -d "{\"index_url\":\"$SITE_URL\",\"query_time\":\"$QUERY_TIME\"}" | "$PY" -I -m json.tool
+
+echo
+echo "== 2) /station-details 站点明细（含待核实链与未核全标志） =="
+curl -s -X POST http://127.0.0.1:8000/station-details \
   -H 'Content-Type: application/json' \
   -d "{\"index_url\":\"$SITE_URL\",\"query_time\":\"$QUERY_TIME\"}" | "$PY" -I -m json.tool

@@ -33,30 +33,72 @@ class _Node:
 
 
 @dataclass
+class ChainRecord:
+    """一条还原后的公告链及其判定中间结果。"""
+
+    chain_ids: list[str]
+    chain_ann: list[Announcement]
+    sources: list[str]
+    root: Announcement
+    route: str | None
+    suspend_start: datetime | None
+    suspend_end: datetime | None
+    latest_published_at: datetime | None
+    inactive_reason: str | None  # None 表示查询时刻有效
+
+
+@dataclass
 class ReconstructionResult:
     active: list[ActiveSuspension]
     inactive: list[InactiveChain]
     unmatched: list[UnmatchedReference]
     # 编号 -> 公告（便于测试/诊断）
     by_id: dict[str, Announcement]
+    chains: list[ChainRecord] = field(default_factory=list)
 
 
 def _sort_key(published_at: datetime) -> datetime:
     return published_at
 
 
-def reconstruct(
-    announcements: list[Announcement], query_time: datetime
-) -> ReconstructionResult:
-    """根据引用关系与发布时间还原公告链并判定有效性。"""
-    by_id: dict[str, Announcement] = {}
-    dupes: set[str] = set()
-    for a in announcements:
-        if a.notice_id in by_id:
-            # 同编号重复抓取：保留发布时间一致的第一条，其余忽略
-            dupes.add(a.notice_id)
+def _current_route(chain_ann: list[Announcement], now: datetime) -> str | None:
+    route = None
+    for a in sorted(chain_ann, key=lambda x: x.published_at):
+        if a.published_at > now:
             continue
-        by_id[a.notice_id] = a
+        if a.route:
+            route = a.route
+    return route
+
+
+def _current_interval(
+    chain_ann: list[Announcement], now: datetime
+) -> tuple[str | None, datetime | None, datetime | None, datetime | None]:
+    route = None
+    start = end = None
+    latest_pub = None
+    for a in sorted(chain_ann, key=lambda x: x.published_at):
+        if a.published_at > now:
+            continue
+        latest_pub = a.published_at
+        if a.route:
+            route = a.route
+        if a.suspend_start is not None:
+            start = a.suspend_start
+        if a.suspend_end is not None:
+            end = a.suspend_end
+    return route, start, end, latest_pub
+
+
+def build_chains(
+    announcements: list[Announcement], query_time: datetime
+) -> tuple[list[ChainRecord], list[UnmatchedReference], dict[str, Announcement]]:
+    """还原公告链并完成有效性判定，返回链记录、悬空引用与编号索引。"""
+    by_id: dict[str, Announcement] = {}
+    for a in announcements:
+        # 同编号重复抓取：保留第一条，其余忽略
+        if a.notice_id not in by_id:
+            by_id[a.notice_id] = a
 
     # 1) 无法匹配的引用：被引用编号在整站公告中不存在
     unmatched: list[UnmatchedReference] = []
@@ -91,8 +133,7 @@ def reconstruct(
     roots = [nid for nid, a in by_id.items() if not has_visible_existing_ref(a)]
     roots.sort(key=lambda nid: (by_id[nid].published_at, nid))
 
-    active: list[ActiveSuspension] = []
-    inactive: list[InactiveChain] = []
+    chains: list[ChainRecord] = []
 
     def walk(path: list[str], seen: set[str]) -> None:
         tail = path[-1]
@@ -111,14 +152,14 @@ def reconstruct(
 
         # 整条链在查询时刻都还未发布
         if not any(i in visible for i in chain_ids):
-            inactive.append(
-                InactiveChain(
-                    root_id=root.notice_id,
+            chains.append(
+                ChainRecord(
+                    chain_ids, chain_ann, sources, root,
                     route=root.route,
-                    reason="not_yet_effective",
-                    chain=chain_ids,
-                    sources=sources,
+                    suspend_start=None,
+                    suspend_end=None,
                     latest_published_at=max(a.published_at for a in chain_ann),
+                    inactive_reason="not_yet_effective",
                 )
             )
             return
@@ -130,14 +171,14 @@ def reconstruct(
             if a.kind is NoticeKind.CANCELLATION and a.published_at <= query_time
         ]
         if cancels:
-            inactive.append(
-                InactiveChain(
-                    root_id=root.notice_id,
-                    route=_current_route(chain_ann),
-                    reason="cancelled",
-                    chain=chain_ids,
-                    sources=sources,
+            chains.append(
+                ChainRecord(
+                    chain_ids, chain_ann, sources, root,
+                    route=_current_route(chain_ann, query_time),
+                    suspend_start=None,
+                    suspend_end=None,
                     latest_published_at=cancels[-1].published_at,
+                    inactive_reason="cancelled",
                 )
             )
             return
@@ -145,19 +186,8 @@ def reconstruct(
         # 按发布时间依次应用更正，后者替换前者的停运信息
         route, start, end, latest_pub = _current_interval(chain_ann, query_time)
         if start is None or end is None:
-            inactive.append(
-                InactiveChain(
-                    root_id=root.notice_id,
-                    route=route,
-                    reason="no_interval",
-                    chain=chain_ids,
-                    sources=sources,
-                    latest_published_at=latest_pub,
-                )
-            )
-            return
-
-        if start > query_time:
+            reason = "no_interval"
+        elif start > query_time:
             reason = "not_yet_effective"
         elif end <= query_time:
             # 半开区间 [start, end)：查询时刻恰为结束时刻时已失效
@@ -165,63 +195,61 @@ def reconstruct(
         else:
             reason = None
 
-        if reason:
+        chains.append(
+            ChainRecord(
+                chain_ids, chain_ann, sources, root,
+                route=route,
+                suspend_start=start,
+                suspend_end=end,
+                latest_published_at=latest_pub,
+                inactive_reason=reason,
+            )
+        )
+
+    for root_id in roots:
+        walk([root_id], {root_id})
+
+    chains.sort(key=lambda c: (c.root.notice_id, tuple(c.chain_ids)))
+    unmatched.sort(key=lambda x: (x.notice_id, x.missing_reference))
+    return chains, unmatched, by_id
+
+
+def reconstruct(
+    announcements: list[Announcement], query_time: datetime
+) -> ReconstructionResult:
+    """根据引用关系与发布时间还原公告链并判定有效性。"""
+    chains, unmatched, by_id = build_chains(announcements, query_time)
+
+    active: list[ActiveSuspension] = []
+    inactive: list[InactiveChain] = []
+
+    for c in chains:
+        if c.inactive_reason is not None:
             inactive.append(
                 InactiveChain(
-                    root_id=root.notice_id,
-                    route=route,
-                    reason=reason,
-                    chain=chain_ids,
-                    sources=sources,
-                    latest_published_at=latest_pub,
+                    root_id=c.root.notice_id,
+                    route=c.route,
+                    reason=c.inactive_reason,
+                    chain=list(c.chain_ids),
+                    sources=list(c.sources),
+                    latest_published_at=c.latest_published_at,
                 )
             )
         else:
             active.append(
                 ActiveSuspension(
-                    route=route or "(未知线路)",
-                    suspend_start=start,
-                    suspend_end=end,
-                    source_chain=chain_ids,
-                    sources=sources,
-                    published_at=latest_pub,
+                    route=c.route or "(未知线路)",
+                    suspend_start=c.suspend_start,
+                    suspend_end=c.suspend_end,
+                    source_chain=list(c.chain_ids),
+                    sources=list(c.sources),
+                    published_at=c.latest_published_at,
                 )
             )
 
-    def _current_route(chain_ann: list[Announcement]) -> str | None:
-        route = None
-        for a in sorted(chain_ann, key=lambda x: x.published_at):
-            if a.published_at > query_time:
-                continue
-            if a.route:
-                route = a.route
-        return route
-
-    def _current_interval(
-        chain_ann: list[Announcement], now: datetime
-    ) -> tuple[str | None, datetime | None, datetime | None, datetime | None]:
-        route = None
-        start = end = None
-        latest_pub = None
-        for a in sorted(chain_ann, key=lambda x: x.published_at):
-            if a.published_at > now:
-                continue
-            latest_pub = a.published_at
-            if a.route:
-                route = a.route
-            if a.suspend_start is not None:
-                start = a.suspend_start
-            if a.suspend_end is not None:
-                end = a.suspend_end
-        return route, start, end, latest_pub
-
-    for root_id in roots:
-        walk([root_id], {root_id})
-
     active.sort(key=lambda x: (x.route, x.suspend_start))
     inactive.sort(key=lambda x: (x.root_id, tuple(x.chain)))
-    unmatched.sort(key=lambda x: (x.notice_id, x.missing_reference))
 
     return ReconstructionResult(
-        active=active, inactive=inactive, unmatched=unmatched, by_id=by_id
+        active=active, inactive=inactive, unmatched=unmatched, by_id=by_id, chains=chains
     )

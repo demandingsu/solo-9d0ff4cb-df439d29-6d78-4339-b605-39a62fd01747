@@ -103,6 +103,21 @@ def _field_rows(soup: BeautifulSoup) -> dict[str, str]:
     return rows
 
 
+def parse_attachment_url(html: str, detail_url: str) -> str | None:
+    """提取详情页中第一个指向 .csv 的附件绝对 URL；没有则 None。
+
+    同站校验由爬虫负责（跨站附件按跨站链接跳过/记录），这里只解析链接。
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    for a in soup.select("a.attachment[href], a[href$='.csv'], a[href$='.CSV']"):
+        href = (a.get("href") or "").strip()
+        if not href:
+            continue
+        if href.lower().split("?", 1)[0].endswith(".csv"):
+            return _abs_url(detail_url, href)
+    return None
+
+
 def parse_detail(html: str, detail_url: str) -> Announcement:
     """解析公告详情页。"""
     soup = BeautifulSoup(html, "html.parser")
@@ -147,6 +162,8 @@ def parse_detail(html: str, detail_url: str) -> Announcement:
         if a.get("data-ref-id", "").strip()
     ]
 
+    attachment_url = parse_attachment_url(html, detail_url)
+
     return Announcement(
         notice_id=notice_id.strip(),
         route=(pick("route", *FIELD_KEYS["route"]) or None),
@@ -157,4 +174,5 @@ def parse_detail(html: str, detail_url: str) -> Announcement:
         references=references,
         url=detail_url,
         title=title,
+        attachment_url=attachment_url,
     )

@@ -7,6 +7,7 @@ import pytest
 
 from app.parser import (
     is_same_site,
+    parse_attachment_url,
     parse_detail,
     parse_detail_links,
     parse_next_page,
@@ -27,13 +28,13 @@ def test_next_page_and_detail_links_index():
 
 
 def test_last_page_has_no_next():
-    html = (HTML_DIR / "page3.html").read_text(encoding="utf-8")
-    assert parse_next_page(html, "http://site:8080/page3.html") is None
+    html = (HTML_DIR / "page5.html").read_text(encoding="utf-8")
+    assert parse_next_page(html, "http://site:8080/page5.html") is None
 
 
 def test_offsite_link_absolute_and_detected():
-    html = (HTML_DIR / "page3.html").read_text(encoding="utf-8")
-    links = parse_detail_links(html, "http://site:8080/page3.html")
+    html = (HTML_DIR / "page5.html").read_text(encoding="utf-8")
+    links = parse_detail_links(html, "http://site:8080/page5.html")
     offsite = [u for u, _, _ in links if "external.example.org" in u]
     assert offsite == ["http://external.example.org/notice/N-EXT-001.html"]
     assert not is_same_site(offsite[0], "http://site:8080/index.html")
@@ -76,3 +77,19 @@ def test_missing_id_raises():
     bad = "<html><body><table class='notice-fields'></table></body></html>"
     with pytest.raises(ValueError):
         parse_detail(bad, "http://site/x.html")
+
+
+def test_attachment_url_parsed_absolute():
+    html = (HTML_DIR / "notices" / "N-2026-001.html").read_text(encoding="utf-8")
+    url = parse_attachment_url(html, "http://site:8080/notices/N-2026-001.html")
+    assert url == "http://site:8080/attachments/N-2026-001.csv"
+
+    detail = parse_detail(html, "http://site:8080/notices/N-2026-001.html")
+    assert detail.attachment_url == url
+
+
+def test_detail_without_attachment_has_none():
+    html = (HTML_DIR / "notices" / "N-2026-007.html").read_text(encoding="utf-8")
+    assert parse_attachment_url(html, "http://site:8080/notices/N-2026-007.html") is None
+    detail = parse_detail(html, "http://site:8080/notices/N-2026-007.html")
+    assert detail.attachment_url is None
